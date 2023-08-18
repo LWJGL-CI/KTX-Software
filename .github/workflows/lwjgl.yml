@@ -1,0 +1,254 @@
+name: LWJGL Build
+# The following:
+#   - fetch-depth: 0
+#   - git remote add upstream https://github.com/KhronosGroup/KTX-Software.git
+#   - git fetch --all --tags
+# are required for the build to correctly set the library version.
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  S3_PARAMS: --cache-control "public,must-revalidate,proxy-revalidate,max-age=0"
+  KTX_CMAKE_PARAMS: -DBASISU_SUPPORT_OPENCL=OFF -DKTX_FEATURE_TESTS=OFF -DKTX_FEATURE_TOOLS=OFF
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    container:
+      image: centos:7
+    strategy:
+      fail-fast: false
+      matrix:
+        ARCH: [x64]
+        include:
+          - ARCH: x64
+            ISA_CMAKE_PARAMS: -DASTCENC_ISA_AVX2=ON -DASTCENC_ISA_SSE41=ON -DASTCENC_ISA_SSE2=ON
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Upgrade git
+        run: |
+          sed -i \
+            -e 's/^mirrorlist/#mirrorlist/' \
+            -e 's/^#baseurl/baseurl/' \
+            -e 's/mirror\.centos\.org/vault.centos.org/' \
+            /etc/yum.repos.d/*.repo
+          yum -y install https://packages.endpointdev.com/rhel/7/os/x86_64/endpoint-repo.x86_64.rpm
+          yum -y install git
+      - name: Clone repository
+        run: git clone --depth 3 https://github.com/${{ github.repository }}.git .
+      - name: Configure yum
+        run: |
+          yum -y install epel-release
+          yum -y update
+      - name: Install build dependencies
+        run: |
+          yum -y install centos-release-scl
+          sed -i \
+            -e 's/^mirrorlist/#mirrorlist/' \
+            -e 's/^#baseurl/baseurl/' \
+            -e 's/^# baseurl/baseurl/' \
+            -e 's/mirror\.centos\.org/vault.centos.org/' \
+            /etc/yum.repos.d/CentOS-SCLo-scl*.repo
+          yum -y install devtoolset-11-gcc-c++
+          yum -y install awscli
+      - name: Install more recent CMake
+        run: |
+          cd /usr/local/src
+          curl -LO https://github.com/Kitware/CMake/releases/download/v3.22.2/cmake-3.22.2-linux-x86_64.sh
+          chmod +x cmake-3.22.2-linux-x86_64.sh
+          ./cmake-3.22.2-linux-x86_64.sh --skip-license --exclude-subdir --prefix=/usr
+      - name: Fetch tags
+        run: |
+          git config --global --add safe.directory $PWD
+          git remote add upstream https://github.com/KhronosGroup/KTX-Software.git
+          git fetch --all --tags
+      - name: Configure build
+        run: |
+          source scl_source enable devtoolset-11 || true
+          cmake -B build $KTX_CMAKE_PARAMS ${{matrix.ISA_CMAKE_PARAMS}} -DCMAKE_C_FLAGS="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+      - name: Build
+        run: |
+          source scl_source enable devtoolset-11 || true
+          cmake --build build --parallel --target ktx
+          strip build/libktx.so
+      - name: Upload artifact
+        run: aws s3 cp build/libktx.so s3://lwjgl-build/nightly/linux/${{matrix.ARCH}}/ ${{env.S3_PARAMS}}
+      - name: Upload git revision
+        run: |
+          git log --first-parent --pretty=format:%H HEAD~2..HEAD~1 > libktx.so.git
+          aws s3 cp libktx.so.git s3://lwjgl-build/nightly/linux/${{matrix.ARCH}}/ ${{env.S3_PARAMS}}
+
+  linux-cross:
+    name: Linux Cross
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ARCH: [arm32, arm64, ppc64le, riscv64]
+        include:
+          # ----
+          - ARCH: arm32
+            CROSS_ARCH: armhf
+            TRIPLET: arm-linux-gnueabihf
+            ISA_CMAKE_PARAMS: -DASTCENC_ISA_NEON=OFF -DASTCENC_ISA_NONE=ON
+          # ----
+          - ARCH: arm64
+            CROSS_ARCH: arm64
+            TRIPLET: aarch64-linux-gnu
+            ISA_CMAKE_PARAMS: -DASTCENC_ISA_NEON=OFF -DASTCENC_ISA_NONE=ON
+          # ----
+          - ARCH: ppc64le
+            CROSS_ARCH: ppc64el
+            TRIPLET: powerpc64le-linux-gnu
+            ISA_CMAKE_PARAMS:
+          # -----
+          - ARCH: riscv64
+            CROSS_ARCH: riscv64
+            TRIPLET: riscv64-linux-gnu
+            ISA_CMAKE_PARAMS:
+    env:
+      LWJGL_ARCH: ${{matrix.ARCH}}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install dependencies
+        run: |
+          DEBIAN_FRONTEND=noninteractive sudo apt-get -yq update
+          DEBIAN_FRONTEND=noninteractive sudo apt-get -yq install awscli cmake gcc-${{matrix.TRIPLET}} g++-${{matrix.TRIPLET}} libc6-dev-${{matrix.CROSS_ARCH}}-cross
+      - name: Fetch tags
+        run: |
+          git config --global --add safe.directory $(pwd)
+          git remote add upstream https://github.com/KhronosGroup/KTX-Software.git
+          git fetch --all --tags
+      - name: Configure build
+        run: PKG_CONFIG_PATH=${PKG_CONFIG_PATH}:${CMAKE_SYSROOT}/usr/lib/${{matrix.TRIPLET}}/pkgconfig CC=${{matrix.TRIPLET}}-gcc CXX=${{matrix.TRIPLET}}-g++ cmake -B build $KTX_CMAKE_PARAMS ${{matrix.ISA_CMAKE_PARAMS}} -DCMAKE_C_FLAGS="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+      - name: Build
+        run: |
+          cmake --build build --parallel --target ktx
+          ${{matrix.TRIPLET}}-strip build/libktx.so
+      - name: Upload artifact
+        run: aws s3 cp build/libktx.so s3://lwjgl-build/nightly/linux/${{matrix.ARCH}}/ ${{env.S3_PARAMS}}
+      - name: Upload git revision
+        run: |
+          git log --first-parent --pretty=format:%H HEAD~2..HEAD~1 > libktx.so.git
+          aws s3 cp libktx.so.git s3://lwjgl-build/nightly/linux/${{matrix.ARCH}}/ ${{env.S3_PARAMS}}
+
+  freebsd-cross:
+    name: FreeBSD Cross
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - name: Build
+        uses: cross-platform-actions/action@v0.27.0
+        with:
+          operating_system: freebsd
+          architecture: x86-64
+          version: '13.4'
+          memory: 4G
+          shell: bash
+          environment_variables: KTX_CMAKE_PARAMS
+          run: |
+            sudo pkg install -y cmake gmake
+            cmake -B build $KTX_CMAKE_PARAMS -DCMAKE_C_FLAGS="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+            cmake --build build --parallel --target ktx
+            strip build/libktx.so
+      - name: Upload artifact
+        run: aws s3 cp build/libktx.so s3://lwjgl-build/nightly/freebsd/x64/ ${{env.S3_PARAMS}}
+      - name: Upload git revision
+        run: |
+          git config --global --add safe.directory $PWD
+          git log --first-parent --pretty=format:%H HEAD~2..HEAD~1 > libktx.so.git
+          aws s3 cp libktx.so.git s3://lwjgl-build/nightly/freebsd/x64/ ${{env.S3_PARAMS}}
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ARCH: [x64, arm64]
+        include:
+          - ARCH: x64
+            ISA_CMAKE_PARAMS: -DASTCENC_ISA_AVX2=ON -DASTCENC_ISA_SSE41=ON -DASTCENC_ISA_SSE2=ON
+            CMAKE_PARAMS: -DCMAKE_OSX_DEPLOYMENT_TARGET=10.11 -DCMAKE_OSX_ARCHITECTURES=x86_64
+          - ARCH: arm64
+            ISA_CMAKE_PARAMS: -DASTCENC_ISA_NEON=ON
+            CMAKE_PARAMS: -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_OSX_ARCHITECTURES=arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch tags
+        run: |
+          git remote add upstream https://github.com/KhronosGroup/KTX-Software.git
+          git fetch --all --tags
+      - name: Configure build
+        run: cmake -B build $KTX_CMAKE_PARAMS ${{matrix.CMAKE_PARAMS}} ${{matrix.ISA_CMAKE_PARAMS}}
+      - name: Build
+        run: |
+          cd build
+          cmake --build . --parallel --target ktx
+          ls -la
+          strip -u -r libktx.dylib
+      - name: Upload artifact
+        run: aws s3 cp build/libktx.dylib s3://lwjgl-build/nightly/macosx/${{matrix.ARCH}}/ ${{env.S3_PARAMS}}
+      - name: Upload git revision
+        run: |
+          git log --first-parent --pretty=format:%H HEAD~2..HEAD~1 > libktx.dylib.git
+          aws s3 cp libktx.dylib.git s3://lwjgl-build/nightly/macosx/${{matrix.ARCH}}/ ${{env.S3_PARAMS}}
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ARCH: [x64, arm64]
+        include:
+          - ARCH: x64
+            PLATFORM: x64
+            ISA_CMAKE_PARAMS: -DASTCENC_ISA_AVX2=ON -DASTCENC_ISA_SSE41=ON -DASTCENC_ISA_SSE2=ON
+          - ARCH: arm64
+            PLATFORM: ARM64
+            ISA_CMAKE_PARAMS: -DASTCENC_ISA_NEON=ON -DASTCENC_ISA_NONE=OFF
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch tags
+        run: |
+          git remote add upstream https://github.com/KhronosGroup/KTX-Software.git
+          git fetch --all --tags
+      - name: Configure build
+        #-T ClangCL
+        run: cmake . -B build -G "Visual Studio 17 2022" -A ${{matrix.PLATFORM}} %KTX_CMAKE_PARAMS% ${{matrix.ISA_CMAKE_PARAMS}}
+      - name: Build
+        run: |
+          cd build
+          cmake --build . --config Release --parallel --target ktx
+      - name: Upload artifact
+        run: aws s3 cp build\Release\ktx.dll s3://lwjgl-build/nightly/windows/${{matrix.ARCH}}/ ${{env.S3_PARAMS}}
+      - name: Upload git revision
+        run: |
+          git log --first-parent --pretty=format:%%H HEAD~2..HEAD~1 > ktx.dll.git
+          aws s3 cp ktx.dll.git s3://lwjgl-build/nightly/windows/${{matrix.ARCH}}/ ${{env.S3_PARAMS}}
