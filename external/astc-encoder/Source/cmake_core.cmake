@@ -175,6 +175,10 @@ macro(astcenc_set_properties ASTCENC_TARGET_NAME ASTCENC_VENEER_TYPE)
             $<${is_gnu_fe}:-Wno-reserved-identifier>
             $<${is_gnu_fe}:-Wno-cast-function-type>
 
+            # LWJGL: GCC bugs on 18.04
+            $<${is_gnu_fe}:-Wno-strict-overflow>
+            $<${is_gnu_fe}:-Wno-attributes>
+
             # Force DWARF4 for Valgrind profiling
             $<$<AND:$<PLATFORM_ID:Linux,Darwin>,${is_clang}>:-gdwarf-4>
 
